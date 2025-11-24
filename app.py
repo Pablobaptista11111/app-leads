@@ -1,9 +1,10 @@
 import os
 import json
 import math
-from flask import Flask, request, render_template_string, jsonify
-from threading import Lock
 import datetime
+from flask import Flask, request, render_template_string, jsonify, Response
+from threading import Lock
+from functools import wraps
 
 app = Flask(__name__)
 
@@ -12,6 +13,27 @@ DATA_DIR = "/app/data"
 DB_FILE = os.path.join(DATA_DIR, 'leads_database.json')
 PER_PAGE = 10 
 db_lock = Lock()
+
+# --- SEGURANÇA (LOGIN) ---
+USUARIO_ADMIN = "admin"
+SENHA_ADMIN = "fullbai123"  # <--- SUA SENHA AQUI
+
+def check_auth(username, password):
+    return username == USUARIO_ADMIN and password == SENHA_ADMIN
+
+def authenticate():
+    return Response(
+    'Acesso negado. Você precisa fazer login para ver os leads.', 401,
+    {'WWW-Authenticate': 'Basic realm="Login Necessario"'})
+
+def requires_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not check_auth(auth.username, auth.password):
+            return authenticate()
+        return f(*args, **kwargs)
+    return decorated
 
 if not os.path.exists(DATA_DIR):
     try: os.makedirs(DATA_DIR)
@@ -41,39 +63,34 @@ def save_lead(new_lead):
 
 # --- ROTAS ---
 
-# Rota GET só para você testar no navegador e não dar erro 405
 @app.route('/webhook/is-captura-09', methods=['GET'])
 def webhook_status():
-    return "Webhook está ATIVO e aguardando dados via POST.", 200
+    return "Webhook ON.", 200
 
 @app.route('/webhook/is-captura-09', methods=['POST'])
 def webhook():
     try:
-        # 1. Tenta pegar como JSON, se falhar, pega como FORM (Elementor Padrão)
         raw_data = {}
-        if request.is_json:
-            raw_data = request.json
-        else:
-            raw_data = request.form.to_dict()
+        if request.is_json: raw_data = request.json
+        else: raw_data = request.form.to_dict()
 
-        # 2. Imprime no log do EasyPanel o que chegou (Para Debug)
-        print(f"DADOS RECEBIDOS: {raw_data}", flush=True)
-
-        # 3. Normaliza os dados (se vier dentro de 'body' ou solto)
-        # O Elementor nativo manda solto. O seu exemplo JSON mandava em 'body'.
-        # Esse código aceita os dois.
+        print(f"RECEBIDO: {raw_data}", flush=True)
         source = raw_data.get('body', raw_data)
 
-        # 4. Mapeia os campos
-        # Tenta pegar 'Nome' (Maiusculo) ou 'nome' (minusculo) ou 'form_fields[name]'
+        # AGORA CAPTURA TUDO
         lead_data = {
             'id': len(load_leads()) + 1, 
             'nome': source.get('Nome') or source.get('nome') or source.get('name') or 'N/A',
             'email': source.get('Email') or source.get('email') or 'N/A',
             'whatsapp': source.get('Seu Whatsapp (DDD) + 9 Digitos') or source.get('whatsapp') or source.get('telephone') or 'N/A',
-            'origem': source.get('utm_source', 'orgânico'),
+            
+            # UTMs Completas
+            'origem': source.get('utm_source', '-'),
+            'midia': source.get('utm_medium', '-'),   # <-- NOVO
             'campanha': source.get('utm_campaign', '-'),
+            'conteudo': source.get('utm_content', '-'), # <-- NOVO
             'termo': source.get('utm_term', '-'),
+            
             'data': source.get('data_hora') or datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
             'form': source.get('form_name') or source.get('form_id', '-')
         }
@@ -82,15 +99,16 @@ def webhook():
         return jsonify({'status': 'success', 'message': 'Lead salvo'}), 200
 
     except Exception as e:
-        print(f"ERRO NO WEBHOOK: {str(e)}", flush=True)
+        print(f"ERRO: {str(e)}", flush=True)
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/', methods=['GET'])
+@requires_auth  # <--- PROTEGE A TELA COM SENHA
 def index():
     leads = load_leads()
     query = request.args.get('search', '').lower()
     if query:
-        leads = [l for l in leads if query in str(l['nome']).lower() or query in str(l['email']).lower() or query in str(l['whatsapp']).lower()]
+        leads = [l for l in leads if query in str(l.get('nome','')).lower() or query in str(l.get('email','')).lower() or query in str(l.get('whatsapp','')).lower()]
 
     page = request.args.get('page', 1, type=int)
     total_leads = len(leads)
@@ -101,7 +119,6 @@ def index():
 
     return render_template_string(HTML_TEMPLATE, leads=leads_paginated, page=page, total_pages=total_pages, total_leads=total_leads, query=query, per_page=PER_PAGE)
 
-# --- HTML IGUAL AO ANTERIOR ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -115,7 +132,7 @@ HTML_TEMPLATE = """
         * { margin: 0; padding: 0; box-sizing: border-box; } 
         body { font-family: "DM Sans", sans-serif; background-color: var(--bg-light); color: var(--text-primary); padding: 2rem 1rem; }
         .container { max-width: 1400px; margin: 0 auto; }
-        .header { margin-bottom: 2rem; }
+        .header { margin-bottom: 2rem; display:flex; justify-content:space-between; align-items:center; }
         .title { font-size: 1.5rem; font-weight: 700; color: var(--text-primary); }
         .toolbar { background-color: var(--bg-white); border-radius: var(--radius); padding: 1rem; margin-bottom: 1rem; display: flex; gap: 1rem; box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05); }
         .search-box { position: relative; flex: 1; }
@@ -133,7 +150,12 @@ HTML_TEMPLATE = """
         .lead-name { font-weight: 500; color: var(--text-primary); }
         .lead-email { color: var(--text-secondary); }
         .whatsapp-badge { display: inline-block; padding: .25rem .5rem; border-radius: 9999px; font-size: .75rem; background-color: rgba(16,185,129,.1); color: #004635; font-weight: 500; }
-        .utm-info div { font-size: 12px; color: #555; line-height: 1.4; }
+        
+        /* COLUNAS UTM */
+        .utm-block { display:flex; flex-direction:column; gap:2px; }
+        .utm-line { font-size: 12px; color: #555; line-height: 1.3; }
+        .utm-label { color: #999; font-size: 11px; font-weight:600; text-transform:uppercase; margin-right:4px; }
+        
         .date-info { font-size: 13px; color: var(--text-muted); }
         .pagination { display: flex; justify-content: space-between; align-items: center; padding: 1rem; border-top: 1px solid var(--border-color); }
         .pagination-info { font-size: .875rem; color: var(--text-secondary); }
@@ -148,7 +170,9 @@ HTML_TEMPLATE = """
     <div class="container">
         <div class="header">
             <h1 class="title">Leads Capturados ({{ total_leads }})</h1>
+            <div style="font-size:12px; color:#999;">🔒 Seguro</div>
         </div>
+
         <div class="toolbar">
             <form action="/" method="get" style="display: flex; gap: 1rem; flex: 1;">
                 <div class="search-box">
@@ -164,45 +188,53 @@ HTML_TEMPLATE = """
                 <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
             </a>
         </div>
+
         <div class="table-container">
             <table class="products-table">
                 <thead>
                     <tr>
-                        <th>NOME</th>
-                        <th>EMAIL</th>
-                        <th>WHATSAPP</th>
-                        <th>ORIGEM (UTM)</th>
-                        <th>CAMPANHA</th>
-                        <th>DATA / HORA</th>
+                        <th>CLIENTE</th>
+                        <th>CONTATO</th>
+                        <th>ORIGEM / MÍDIA</th>
+                        <th>CAMPANHA / CONTEÚDO</th>
+                        <th>DATA</th>
                     </tr>
                 </thead>
                 <tbody>
                     {% for lead in leads %}
                     <tr>
-                        <td><span class="lead-name">{{ lead.nome }}</span></td>
-                        <td><span class="lead-email">{{ lead.email }}</span></td>
-                        <td><span class="whatsapp-badge">{{ lead.whatsapp }}</span></td>
                         <td>
-                            <div class="utm-info">
-                                <div><strong>Source:</strong> {{ lead.origem }}</div>
-                                <div><strong>Term:</strong> {{ lead.termo }}</div>
+                            <div class="lead-name">{{ lead.nome }}</div>
+                            <div style="font-size:11px; color:#999;">ID: {{ lead.id }}</div>
+                        </td>
+                        <td>
+                            <div class="lead-email">{{ lead.email }}</div>
+                            <span class="whatsapp-badge">{{ lead.whatsapp }}</span>
+                        </td>
+                        <td>
+                            <div class="utm-block">
+                                <div class="utm-line"><span class="utm-label">SRC:</span> {{ lead.origem }}</div>
+                                <div class="utm-line"><span class="utm-label">MED:</span> {{ lead.get('midia', '-') }}</div>
+                                <div class="utm-line"><span class="utm-label">TRM:</span> {{ lead.get('termo', '-') }}</div>
                             </div>
                         </td>
                         <td>
-                            <div class="utm-info">
-                                <div>{{ lead.campanha }}</div>
-                                <div style="color: #999; font-size: 11px;">{{ lead.form }}</div>
+                            <div class="utm-block">
+                                <div class="utm-line"><span class="utm-label">CMP:</span> {{ lead.campanha }}</div>
+                                <div class="utm-line"><span class="utm-label">CNT:</span> {{ lead.get('conteudo', '-') }}</div>
+                                <div class="utm-line"><span class="utm-label">FRM:</span> {{ lead.form }}</div>
                             </div>
                         </td>
                         <td><span class="date-info">{{ lead.data }}</span></td>
                     </tr>
                     {% else %}
                     <tr>
-                        <td colspan="6" style="text-align: center; padding: 2rem;">Nenhum lead encontrado.</td>
+                        <td colspan="5" style="text-align: center; padding: 2rem;">Nenhum lead encontrado.</td>
                     </tr>
                     {% endfor %}
                 </tbody>
             </table>
+
             {% if total_pages > 1 %}
             <div class="pagination">
                 <div class="pagination-info">Página {{ page }} de {{ total_pages }}</div>
