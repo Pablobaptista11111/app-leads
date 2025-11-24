@@ -1,119 +1,107 @@
-
 import os
 import json
 import math
 from flask import Flask, request, render_template_string, jsonify
 from threading import Lock
+import datetime
 
 app = Flask(__name__)
 
-# --- CONFIGURAÇÃO AJUSTADA PARA EASYPANEL ---
-# Pasta segura onde o EasyPanel guarda os dados (Volume)
+# --- CONFIGURAÇÃO ---
 DATA_DIR = "/app/data"
 DB_FILE = os.path.join(DATA_DIR, 'leads_database.json')
-
 PER_PAGE = 10 
 db_lock = Lock()
 
-# Garante que a pasta existe
 if not os.path.exists(DATA_DIR):
     try: os.makedirs(DATA_DIR)
     except: pass
 
-# --- FUNÇÕES DE BANCO DE DADOS ---
-
+# --- BANCO DE DADOS ---
 def init_db():
-    """Cria o arquivo JSON se não existir."""
     if not os.path.exists(DB_FILE):
         try:
-            with open(DB_FILE, 'w', encoding='utf-8') as f:
-                json.dump([], f)
-        except Exception as e:
-            print(f"Erro ao criar banco: {e}")
+            with open(DB_FILE, 'w', encoding='utf-8') as f: json.dump([], f)
+        except: pass
 
 def load_leads():
-    """Carrega leads do arquivo JSON."""
     init_db()
     try:
-        with open(DB_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except:
-        return []
+        with open(DB_FILE, 'r', encoding='utf-8') as f: return json.load(f)
+    except: return []
 
 def save_lead(new_lead):
-    """Salva um novo lead no topo da lista de forma segura."""
     with db_lock: 
         leads = load_leads()
         leads.insert(0, new_lead)
         try:
             with open(DB_FILE, 'w', encoding='utf-8') as f:
                 json.dump(leads, f, indent=4, ensure_ascii=False)
-        except Exception as e:
-            print(f"Erro ao salvar lead: {e}")
+        except: pass
 
 # --- ROTAS ---
 
+# Rota GET só para você testar no navegador e não dar erro 405
+@app.route('/webhook/is-captura-09', methods=['GET'])
+def webhook_status():
+    return "Webhook está ATIVO e aguardando dados via POST.", 200
+
 @app.route('/webhook/is-captura-09', methods=['POST'])
 def webhook():
-    """Recebe o Webhook do Elementor."""
     try:
-        data = request.json
-        
-        if not data or 'body' not in data:
-            return jsonify({'status': 'error', 'message': 'Formato inválido'}), 400
+        # 1. Tenta pegar como JSON, se falhar, pega como FORM (Elementor Padrão)
+        raw_data = {}
+        if request.is_json:
+            raw_data = request.json
+        else:
+            raw_data = request.form.to_dict()
 
-        body = data['body']
+        # 2. Imprime no log do EasyPanel o que chegou (Para Debug)
+        print(f"DADOS RECEBIDOS: {raw_data}", flush=True)
 
+        # 3. Normaliza os dados (se vier dentro de 'body' ou solto)
+        # O Elementor nativo manda solto. O seu exemplo JSON mandava em 'body'.
+        # Esse código aceita os dois.
+        source = raw_data.get('body', raw_data)
+
+        # 4. Mapeia os campos
+        # Tenta pegar 'Nome' (Maiusculo) ou 'nome' (minusculo) ou 'form_fields[name]'
         lead_data = {
             'id': len(load_leads()) + 1, 
-            'nome': body.get('Nome', 'N/A'),
-            'email': body.get('Email', 'N/A'),
-            'whatsapp': body.get('Seu Whatsapp (DDD) + 9 Digitos', 'N/A'),
-            'origem': body.get('utm_source', 'orgânico'),
-            'campanha': body.get('utm_campaign', '-'),
-            'termo': body.get('utm_term', '-'),
-            'data': body.get('data_hora', '-'),
-            'form': body.get('form_name', '-')
+            'nome': source.get('Nome') or source.get('nome') or source.get('name') or 'N/A',
+            'email': source.get('Email') or source.get('email') or 'N/A',
+            'whatsapp': source.get('Seu Whatsapp (DDD) + 9 Digitos') or source.get('whatsapp') or source.get('telephone') or 'N/A',
+            'origem': source.get('utm_source', 'orgânico'),
+            'campanha': source.get('utm_campaign', '-'),
+            'termo': source.get('utm_term', '-'),
+            'data': source.get('data_hora') or datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+            'form': source.get('form_name') or source.get('form_id', '-')
         }
 
         save_lead(lead_data)
-        return jsonify({'status': 'success', 'message': 'Lead salvo com sucesso'}), 200
+        return jsonify({'status': 'success', 'message': 'Lead salvo'}), 200
 
     except Exception as e:
+        print(f"ERRO NO WEBHOOK: {str(e)}", flush=True)
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/', methods=['GET'])
 def index():
-    """Exibe o painel de leads."""
     leads = load_leads()
-    
     query = request.args.get('search', '').lower()
     if query:
-        leads = [
-            l for l in leads 
-            if query in str(l['nome']).lower() or 
-               query in str(l['email']).lower() or 
-               query in str(l['whatsapp']).lower()
-        ]
+        leads = [l for l in leads if query in str(l['nome']).lower() or query in str(l['email']).lower() or query in str(l['whatsapp']).lower()]
 
     page = request.args.get('page', 1, type=int)
     total_leads = len(leads)
     total_pages = math.ceil(total_leads / PER_PAGE)
-    
     start = (page - 1) * PER_PAGE
     end = start + PER_PAGE
-    
     leads_paginated = leads[start:end]
 
-    return render_template_string(HTML_TEMPLATE, 
-                                  leads=leads_paginated, 
-                                  page=page, 
-                                  total_pages=total_pages, 
-                                  total_leads=total_leads,
-                                  query=query,
-                                  per_page=PER_PAGE)
+    return render_template_string(HTML_TEMPLATE, leads=leads_paginated, page=page, total_pages=total_pages, total_leads=total_leads, query=query, per_page=PER_PAGE)
 
-# --- TEMPLATE HTML ---
+# --- HTML IGUAL AO ANTERIOR ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -238,5 +226,4 @@ HTML_TEMPLATE = """
 """
 
 if __name__ == '__main__':
-    # Porta 80 para facilitar no EasyPanel
     app.run(host='0.0.0.0', port=80)
