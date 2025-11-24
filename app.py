@@ -1,29 +1,75 @@
 import os
-import json
+import sqlite3
 import math
 import datetime
-from flask import Flask, request, render_template_string, jsonify, Response
-from threading import Lock
+from flask import Flask, request, render_template_string, jsonify, Response, g
 from functools import wraps
 
 app = Flask(__name__)
 
 # --- CONFIGURAÇÃO ---
 DATA_DIR = "/app/data"
-DB_FILE = os.path.join(DATA_DIR, 'leads_database.json')
+DB_FILE = os.path.join(DATA_DIR, 'leads.db')
 PER_PAGE = 10 
-db_lock = Lock()
 
 # --- SEGURANÇA (LOGIN) ---
 USUARIO_ADMIN = "admin"
-SENHA_ADMIN = "fullbai123"  # <--- SUA SENHA AQUI
+SENHA_ADMIN = "fullbai123"
 
+if not os.path.exists(DATA_DIR):
+    try: os.makedirs(DATA_DIR)
+    except: pass
+
+# --- CONEXÃO COM BANCO (SQLite) ---
+def get_db():
+    db = getattr(g, '_database', None)
+    if db is None:
+        db = g._database = sqlite3.connect(DB_FILE)
+        db.row_factory = sqlite3.Row # Permite acessar colunas pelo nome
+    return db
+
+@app.teardown_appcontext
+def close_connection(exception):
+    db = getattr(g, '_database', None)
+    if db is not None:
+        db.close()
+
+def init_db():
+    """Cria a tabela se não existir"""
+    with app.app_context():
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS leads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nome TEXT,
+                email TEXT,
+                whatsapp TEXT,
+                origem TEXT,
+                midia TEXT,
+                campanha TEXT,
+                conteudo TEXT,
+                termo TEXT,
+                data_hora TEXT,
+                form_name TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        # Cria indices para busca ficar rapida mesmo com 1 milhao
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_nome ON leads(nome)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_email ON leads(email)')
+        db.commit()
+
+# Inicializa banco ao ligar
+init_db()
+
+# --- FUNÇÕES AUXILIARES ---
 def check_auth(username, password):
     return username == USUARIO_ADMIN and password == SENHA_ADMIN
 
 def authenticate():
     return Response(
-    'Acesso negado. Você precisa fazer login para ver os leads.', 401,
+    'Acesso negado.', 401,
     {'WWW-Authenticate': 'Basic realm="Login Necessario"'})
 
 def requires_auth(f):
@@ -35,37 +81,11 @@ def requires_auth(f):
         return f(*args, **kwargs)
     return decorated
 
-if not os.path.exists(DATA_DIR):
-    try: os.makedirs(DATA_DIR)
-    except: pass
-
-# --- BANCO DE DADOS ---
-def init_db():
-    if not os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, 'w', encoding='utf-8') as f: json.dump([], f)
-        except: pass
-
-def load_leads():
-    init_db()
-    try:
-        with open(DB_FILE, 'r', encoding='utf-8') as f: return json.load(f)
-    except: return []
-
-def save_lead(new_lead):
-    with db_lock: 
-        leads = load_leads()
-        leads.insert(0, new_lead)
-        try:
-            with open(DB_FILE, 'w', encoding='utf-8') as f:
-                json.dump(leads, f, indent=4, ensure_ascii=False)
-        except: pass
-
 # --- ROTAS ---
 
 @app.route('/webhook/is-captura-09', methods=['GET'])
 def webhook_status():
-    return "Webhook ON.", 200
+    return "Webhook SQLite ON.", 200
 
 @app.route('/webhook/is-captura-09', methods=['POST'])
 def webhook():
@@ -77,47 +97,64 @@ def webhook():
         print(f"RECEBIDO: {raw_data}", flush=True)
         source = raw_data.get('body', raw_data)
 
-        # AGORA CAPTURA TUDO
-        lead_data = {
-            'id': len(load_leads()) + 1, 
-            'nome': source.get('Nome') or source.get('nome') or source.get('name') or 'N/A',
-            'email': source.get('Email') or source.get('email') or 'N/A',
-            'whatsapp': source.get('Seu Whatsapp (DDD) + 9 Digitos') or source.get('whatsapp') or source.get('telephone') or 'N/A',
-            
-            # UTMs Completas
-            'origem': source.get('utm_source', '-'),
-            'midia': source.get('utm_medium', '-'),   # <-- NOVO
-            'campanha': source.get('utm_campaign', '-'),
-            'conteudo': source.get('utm_content', '-'), # <-- NOVO
-            'termo': source.get('utm_term', '-'),
-            
-            'data': source.get('data_hora') or datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-            'form': source.get('form_name') or source.get('form_id', '-')
-        }
+        # Dados limpos
+        nome = source.get('Nome') or source.get('nome') or source.get('name') or 'N/A'
+        email = source.get('Email') or source.get('email') or 'N/A'
+        whatsapp = source.get('Seu Whatsapp (DDD) + 9 Digitos') or source.get('whatsapp') or 'N/A'
+        origem = source.get('utm_source', '-')
+        midia = source.get('utm_medium', '-')
+        campanha = source.get('utm_campaign', '-')
+        conteudo = source.get('utm_content', '-')
+        termo = source.get('utm_term', '-')
+        data_hora = source.get('data_hora') or datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        form_name = source.get('form_name') or source.get('form_id', '-')
 
-        save_lead(lead_data)
+        # Inserção Otimizada no SQL
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute('''
+            INSERT INTO leads (nome, email, whatsapp, origem, midia, campanha, conteudo, termo, data_hora, form_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (nome, email, whatsapp, origem, midia, campanha, conteudo, termo, data_hora, form_name))
+        db.commit()
+
         return jsonify({'status': 'success', 'message': 'Lead salvo'}), 200
 
     except Exception as e:
-        print(f"ERRO: {str(e)}", flush=True)
+        print(f"ERRO SQL: {str(e)}", flush=True)
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/', methods=['GET'])
-@requires_auth  # <--- PROTEGE A TELA COM SENHA
+@requires_auth
 def index():
-    leads = load_leads()
-    query = request.args.get('search', '').lower()
-    if query:
-        leads = [l for l in leads if query in str(l.get('nome','')).lower() or query in str(l.get('email','')).lower() or query in str(l.get('whatsapp','')).lower()]
-
+    db = get_db()
+    cursor = db.cursor()
+    
+    # Parâmetros
+    query_search = request.args.get('search', '').strip()
     page = request.args.get('page', 1, type=int)
-    total_leads = len(leads)
-    total_pages = math.ceil(total_leads / PER_PAGE)
-    start = (page - 1) * PER_PAGE
-    end = start + PER_PAGE
-    leads_paginated = leads[start:end]
+    offset = (page - 1) * PER_PAGE
 
-    return render_template_string(HTML_TEMPLATE, leads=leads_paginated, page=page, total_pages=total_pages, total_leads=total_leads, query=query, per_page=PER_PAGE)
+    # Montagem da Query Inteligente
+    sql_base = "FROM leads"
+    params = []
+    
+    if query_search:
+        sql_base += " WHERE nome LIKE ? OR email LIKE ? OR whatsapp LIKE ?"
+        term = f"%{query_search}%"
+        params.extend([term, term, term])
+
+    # Conta total (Rápido)
+    cursor.execute(f"SELECT COUNT(*) {sql_base}", params)
+    total_leads = cursor.fetchone()[0]
+    total_pages = math.ceil(total_leads / PER_PAGE)
+
+    # Busca paginada (Só pega os 10 necessários)
+    # ORDER BY id DESC garante que o mais novo aparece primeiro
+    cursor.execute(f"SELECT * {sql_base} ORDER BY id DESC LIMIT ? OFFSET ?", params + [PER_PAGE, offset])
+    leads = cursor.fetchall()
+
+    return render_template_string(HTML_TEMPLATE, leads=leads, page=page, total_pages=total_pages, total_leads=total_leads, query=query_search, per_page=PER_PAGE)
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -125,7 +162,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Gestão de Leads</title>
+    <title>Gestão de Leads (SQLite)</title>
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
     <style>
         :root { --primary-color: #004635; --primary-hover: #1f8659; --text-primary: #111827; --text-secondary: #4b5563; --text-muted: #6b7280; --bg-white: #ffffff; --bg-light: #f9fafb; --bg-gray: #f3f4f6; --border-color: #e5e7eb; --radius: .5rem; }
@@ -150,12 +187,9 @@ HTML_TEMPLATE = """
         .lead-name { font-weight: 500; color: var(--text-primary); }
         .lead-email { color: var(--text-secondary); }
         .whatsapp-badge { display: inline-block; padding: .25rem .5rem; border-radius: 9999px; font-size: .75rem; background-color: rgba(16,185,129,.1); color: #004635; font-weight: 500; }
-        
-        /* COLUNAS UTM */
         .utm-block { display:flex; flex-direction:column; gap:2px; }
         .utm-line { font-size: 12px; color: #555; line-height: 1.3; }
         .utm-label { color: #999; font-size: 11px; font-weight:600; text-transform:uppercase; margin-right:4px; }
-        
         .date-info { font-size: 13px; color: var(--text-muted); }
         .pagination { display: flex; justify-content: space-between; align-items: center; padding: 1rem; border-top: 1px solid var(--border-color); }
         .pagination-info { font-size: .875rem; color: var(--text-secondary); }
@@ -170,7 +204,7 @@ HTML_TEMPLATE = """
     <div class="container">
         <div class="header">
             <h1 class="title">Leads Capturados ({{ total_leads }})</h1>
-            <div style="font-size:12px; color:#999;">🔒 Seguro</div>
+            <div style="font-size:12px; color:#999;">⚡ Alta Performance</div>
         </div>
 
         <div class="toolbar">
@@ -204,28 +238,28 @@ HTML_TEMPLATE = """
                     {% for lead in leads %}
                     <tr>
                         <td>
-                            <div class="lead-name">{{ lead.nome }}</div>
-                            <div style="font-size:11px; color:#999;">ID: {{ lead.id }}</div>
+                            <div class="lead-name">{{ lead['nome'] }}</div>
+                            <div style="font-size:11px; color:#999;">ID: {{ lead['id'] }}</div>
                         </td>
                         <td>
-                            <div class="lead-email">{{ lead.email }}</div>
-                            <span class="whatsapp-badge">{{ lead.whatsapp }}</span>
+                            <div class="lead-email">{{ lead['email'] }}</div>
+                            <span class="whatsapp-badge">{{ lead['whatsapp'] }}</span>
                         </td>
                         <td>
                             <div class="utm-block">
-                                <div class="utm-line"><span class="utm-label">SRC:</span> {{ lead.origem }}</div>
-                                <div class="utm-line"><span class="utm-label">MED:</span> {{ lead.get('midia', '-') }}</div>
-                                <div class="utm-line"><span class="utm-label">TRM:</span> {{ lead.get('termo', '-') }}</div>
+                                <div class="utm-line"><span class="utm-label">SRC:</span> {{ lead['origem'] }}</div>
+                                <div class="utm-line"><span class="utm-label">MED:</span> {{ lead['midia'] }}</div>
+                                <div class="utm-line"><span class="utm-label">TRM:</span> {{ lead['termo'] }}</div>
                             </div>
                         </td>
                         <td>
                             <div class="utm-block">
-                                <div class="utm-line"><span class="utm-label">CMP:</span> {{ lead.campanha }}</div>
-                                <div class="utm-line"><span class="utm-label">CNT:</span> {{ lead.get('conteudo', '-') }}</div>
-                                <div class="utm-line"><span class="utm-label">FRM:</span> {{ lead.form }}</div>
+                                <div class="utm-line"><span class="utm-label">CMP:</span> {{ lead['campanha'] }}</div>
+                                <div class="utm-line"><span class="utm-label">CNT:</span> {{ lead['conteudo'] }}</div>
+                                <div class="utm-line"><span class="utm-label">FRM:</span> {{ lead['form_name'] }}</div>
                             </div>
                         </td>
-                        <td><span class="date-info">{{ lead.data }}</span></td>
+                        <td><span class="date-info">{{ lead['data_hora'] }}</span></td>
                     </tr>
                     {% else %}
                     <tr>
@@ -240,6 +274,7 @@ HTML_TEMPLATE = """
                 <div class="pagination-info">Página {{ page }} de {{ total_pages }}</div>
                 <div class="pagination-controls">
                     <a href="/?page={{ page - 1 }}&search={{ query }}" class="page-btn {% if page <= 1 %}disabled{% endif %}">&lt;</a>
+                    
                     {% for p in range(1, total_pages + 1) %}
                         {% if p == page or p == 1 or p == total_pages or (p >= page - 2 and p <= page + 2) %}
                             <a href="/?page={{ p }}&search={{ query }}" class="page-btn {% if p == page %}active{% endif %}">{{ p }}</a>
@@ -247,6 +282,7 @@ HTML_TEMPLATE = """
                             <span style="padding: .5rem;">...</span>
                         {% endif %}
                     {% endfor %}
+
                     <a href="/?page={{ page + 1 }}&search={{ query }}" class="page-btn {% if page >= total_pages %}disabled{% endif %}">&gt;</a>
                 </div>
             </div>
@@ -258,4 +294,6 @@ HTML_TEMPLATE = """
 """
 
 if __name__ == '__main__':
+    # Garante que o banco existe ao iniciar
+    init_db()
     app.run(host='0.0.0.0', port=80)
